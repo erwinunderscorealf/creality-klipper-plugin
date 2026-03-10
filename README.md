@@ -106,9 +106,68 @@ journalctl -u creality-klipper -f
 | Auto home | ✅ |
 | Print progress reporting | ✅ |
 | Print time remaining | ✅ |
-| Layer reporting | ⚠️ Requires DisplayLayerProgress equivalent in Klipper |
 | LED control | ⚠️ Configure gcode macros in printer.cfg |
-| Video streaming | ❌ Not supported |
+| Video streaming | ⚠️ Experimental, see below |
+
+## Video streaming (Fluidd / local network)
+
+IP cameras (e.g. Tapo C100) can be bridged to Fluidd using [go2rtc](https://github.com/AlexxIT/go2rtc), which transcodes RTSP → MJPEG.
+
+### 1. Download go2rtc
+
+```bash
+curl -L -o ~/go2rtc https://github.com/AlexxIT/go2rtc/releases/latest/download/go2rtc_linux_arm64
+chmod +x ~/go2rtc
+```
+
+### 2. Create ~/go2rtc.yaml
+
+```yaml
+api:
+  listen: :1984
+  origin: "*"
+
+ffmpeg:
+  bin: ffmpeg
+
+streams:
+  my_camera:
+    - rtsp://user:password@192.168.x.x:554/stream1
+    - "ffmpeg:my_camera#video=mjpeg"
+```
+
+Add one entry per camera. The `ffmpeg` transcoding line is required because Tapo cameras stream H264, not MJPEG.
+
+### 3. Install as a systemd service
+
+```bash
+sudo tee /etc/systemd/system/go2rtc.service << 'EOF'
+[Unit]
+Description=go2rtc RTSP proxy
+After=network.target
+
+[Service]
+User=pi
+ExecStart=/home/pi/go2rtc -config /home/pi/go2rtc.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable go2rtc
+sudo systemctl start go2rtc
+```
+
+### 4. Add to Fluidd
+
+In Fluidd go to **Settings → Webcams → Add webcam**:
+- Stream type: **MJPEG Stream**
+- URL: `http://<pi-ip>:1984/api/stream.mjpeg?src=my_camera`
+
+> Note: Video streaming in the Creality Cloud app requires Creality's proprietary relay infrastructure and is not currently supported.
 
 ## Logs
 
