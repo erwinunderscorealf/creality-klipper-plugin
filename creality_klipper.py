@@ -27,7 +27,7 @@ from tb_device_mqtt import TBDeviceMqttClient
 #  Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
@@ -374,7 +374,7 @@ class CrealityKlipperPlugin:
             logger.warning(f"Could not save session: {e}")
 
     def _close_previous_session(self):
-        """On startup, if last session had an active job, send state:2 to close it."""
+        """On startup, if last session had an active job, either restore or close it."""
         if not os.path.exists(self._session_path):
             return
         try:
@@ -382,11 +382,20 @@ class CrealityKlipperPlugin:
                 session = json.load(f)
             print_id = session.get("printId", "")
             last_state = session.get("state", 0)
-            if print_id and last_state in (1, 5):
-                logger.info(f"Closing previous session job printId={print_id}")
-                self._send_attributes({"state": 2, "printId": print_id, "mcu_is_print": 0})
-                self._send_telemetry({"printProgress": 100, "printLeftTime": 0, "dProgress": 100})
-                time.sleep(1)
+            if not print_id or last_state not in (1, 5):
+                return
+            # If Moonraker is still printing, restore session instead of closing it
+            moonraker_state = self.moonraker.get_print_stats().get("state", "standby")
+            if moonraker_state in ("printing", "paused"):
+                logger.info(f"Resuming previous session: Moonraker is {moonraker_state}, printId={print_id}")
+                self._print_id = print_id
+                self._state = 1 if moonraker_state == "printing" else 5
+                return
+            # Moonraker is idle — close the cloud job
+            logger.info(f"Closing previous session job printId={print_id}")
+            self._send_attributes({"state": 2, "printId": print_id, "mcu_is_print": 0})
+            self._send_telemetry({"printProgress": 100, "printLeftTime": 0, "dProgress": 100})
+            time.sleep(1)
         except Exception as e:
             logger.warning(f"Could not close previous session: {e}")
         finally:
@@ -600,7 +609,9 @@ class CrealityKlipperPlugin:
                 self._layer = self._current_layer
                 self._last_z = current_z
                 self._attributes_msg["layer"] = self._current_layer
+                self._attributes_msg["curLayer"] = self._current_layer
                 self._telemetry_msg["layer"] = self._current_layer
+                self._telemetry_msg["curLayer"] = self._current_layer
                 if self._total_layers:
                     self._attributes_msg["totalLayer"] = self._total_layers
                     self._telemetry_msg["totalLayer"] = self._total_layers
@@ -653,7 +664,6 @@ class CrealityKlipperPlugin:
 
     def _send_telemetry(self, payload):
         try:
-            logger.debug(f"send_telemetry: {payload}")
             self.client.send_telemetry(payload)
         except Exception as e:
             logger.error(f"send_telemetry failed: {e}")
@@ -779,7 +789,7 @@ class CrealityKlipperPlugin:
             # File listing - not yet implemented, return empty
             self._send_attributes({"retGcodeFileInfo": "[]"})
 
-        elif prop == "jwtToken":
+        elif prop in ("jwtToken", "token"):
             # Creality Cloud session token refresh - acknowledge and ignore
             logger.info("jwtToken refresh received, acknowledging")
 
@@ -943,7 +953,8 @@ class CrealityKlipperPlugin:
                 except Exception:
                     self._auto_bed_level = bool(self.config.get("auto_bed_level", False))
 
-            # Start printing
+            # Start printing — reset grace period now that print is actually starting
+            self._ignore_complete_until = time.time() + 60
             time.sleep(1)
             self.moonraker.start_print(local_filename)
 
