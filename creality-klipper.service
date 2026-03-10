@@ -1,0 +1,18 @@
+[Unit]
+Description=Creality Cloud Klipper Plugin
+After=network-online.target moonraker.service
+Wants=network-online.target
+Requires=moonraker.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/creality-klipper-plugin
+ExecStart=/home/pi/creality-klipper-plugin/venv/bin/python3 creality_klipper.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

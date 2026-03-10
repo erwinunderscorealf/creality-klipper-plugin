@@ -1,0 +1,20 @@
+# Claude Code settings
+.claude/
+
+# Credentials and device configs — never commit these
+config*.json
+*_session.json
+*.tk
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.bak
+
+# Logs
+*.log
+/tmp/
+
+# Printer-specific directories
+printers/
