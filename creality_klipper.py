@@ -765,11 +765,21 @@ class CrealityKlipperPlugin:
 
         elif prop == "fan":
             v = int(value)
-            if v == 1:
-                self.moonraker.set_fan_speed(255)
-            else:
-                self.moonraker.set_fan_speed(0)
+            pin_value = 255 if v == 1 else 0
+            self.moonraker.send_gcode(f"SET_PIN PIN=fan0 VALUE={pin_value}")
             self._attributes_msg["fan"] = v
+
+        elif prop == "modelFanPct":
+            pct = max(0, min(100, int(value)))
+            pin_value = round(pct * 255 / 100)
+            self.moonraker.send_gcode(f"SET_PIN PIN=fan0 VALUE={pin_value}")
+            self._attributes_msg["modelFanPct"] = pct
+
+        elif prop == "caseFanPct":
+            pct = max(0, min(100, int(value)))
+            pin_value = round(pct * 255 / 100)
+            self.moonraker.send_gcode(f"SET_PIN PIN=fan2 VALUE={pin_value}")
+            self._attributes_msg["caseFanPct"] = pct
 
         elif prop == "led":
             v = int(value)
