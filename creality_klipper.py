@@ -772,10 +772,10 @@ class CrealityKlipperPlugin:
             self._attributes_msg["fan"] = v
 
         elif prop == "led":
-            # CR10S Pro / CR-X Pro don't have LED control via Klipper by default
-            # Add your LED gcode here if you have one configured
             v = int(value)
-            logger.info(f"LED set to {v} - configure LED gcode in your printer.cfg if needed")
+            pin_value = 1 if v else 0
+            self.moonraker.send_gcode(f"SET_PIN PIN=LED VALUE={pin_value}")
+            logger.info(f"LED set to {v}")
             self._attributes_msg["led_state"] = v
 
         elif prop == "autohome":

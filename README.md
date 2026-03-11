@@ -106,7 +106,7 @@ journalctl -u creality-klipper -f
 | Auto home | ✅ |
 | Print progress reporting | ✅ |
 | Print time remaining | ✅ |
-| LED control | ⚠️ Configure gcode macros in printer.cfg |
+| LED control | ✅ Requires `[output_pin LED]` in printer.cfg |
 | Video streaming | ⚠️ Experimental, see below |
 
 ## Video streaming (Fluidd / local network)
