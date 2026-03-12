@@ -9,6 +9,8 @@ Replaces the OctoPrint CrealityCloud plugin for Klipper-based setups.
 Author: Built for Erwin's CR10S Pro / CR10S Pro V2 / CR-X Pro setup
 """
 
+import asyncio
+import base64
 import gzip
 import json
 import logging
@@ -298,6 +300,172 @@ class MoonrakerClient:
 
 
 # ─────────────────────────────────────────────
+#  WebRTC bridge (Creality signaling ↔ go2rtc)
+# ─────────────────────────────────────────────
+class CrealityWebRTCBridge:
+    """
+    Bridges Creality Cloud WebRTC signaling to go2rtc.
+
+    Flow:
+    1. Connect to Creality WebSocket signaling server with jwtToken
+    2. Send join message identifying as the device
+    3. Receive SDP offer from the phone
+    4. POST offer to go2rtc → receive SDP answer
+    5. Send answer back to Creality signaling server
+    6. Phone connects directly to go2rtc for H264 video
+    """
+
+    SIGNALING_HOST_CN = "api.crealitycloud.cn"
+    SIGNALING_HOST_INT = "api.crealitycloud.com"
+    SIGNALING_PATH = "/api/cxy/ws/webrtc/signal/push/{sn}"
+
+    def __init__(self, jwt_token, device_sn, go2rtc_url, stream_name,
+                 region=1, app_version="1.3.3.46", model="CR-K1"):
+        self.jwt_token = jwt_token
+        self.device_sn = device_sn
+        self.go2rtc_url = go2rtc_url
+        self.stream_name = stream_name
+        self.region = region
+        self.app_version = app_version
+        self.model = model
+
+    def _ws_url(self):
+        host = self.SIGNALING_HOST_CN if self.region == 0 else self.SIGNALING_HOST_INT
+        path = self.SIGNALING_PATH.format(sn=self.device_sn)
+        return f"wss://{host}{path}"
+
+    def _join_msg(self):
+        return json.dumps({
+            "action": "join",
+            "to": "server",
+            "clientCtx": {
+                "device_brand": "creality",
+                "os_version": "linux",
+                "platform_type": 10,
+                "app_version": self.app_version,
+                "sn": self.device_sn,
+                "model": self.model,
+            },
+            "token": {"jwtToken": self.jwt_token},
+        })
+
+    def _post_offer_to_go2rtc(self, offer_sdp):
+        """POST SDP offer to go2rtc, return SDP answer string or None."""
+        try:
+            url = f"{self.go2rtc_url}/api/webrtc?src={self.stream_name}"
+            logger.info(f"go2rtc POST {url}")
+            r = requests.post(url, data=offer_sdp,
+                              headers={"Content-Type": "application/sdp"},
+                              timeout=20)
+            logger.info(f"go2rtc response: status={r.status_code} len={len(r.text)}")
+            if r.status_code in (200, 201) and r.text.strip().startswith("v="):
+                return r.text
+            logger.error(f"go2rtc error {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.error(f"go2rtc offer POST failed: {e}")
+        return None
+
+    async def _run_async(self):
+        import websockets as _ws
+        ws_url = self._ws_url()
+        logger.info(f"WebRTC: connecting to {ws_url}")
+        try:
+            async with _ws.connect(ws_url, ssl=True) as ws:
+                await ws.send(self._join_msg())
+                logger.info(f"WebRTC: join sent for sn={self.device_sn}")
+
+                offer_sdp = None
+                caller_id = None
+
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    action = msg.get("action", "")
+                    sdp_msg = msg.get("sdpMessage", {})
+                    sdp_type = sdp_msg.get("type", "")
+                    caller_id = msg.get("from", caller_id)
+
+                    if action == "ice_msg" and sdp_type == "offer":
+                        offer_sdp = sdp_msg["data"]["sdp"]
+                        logger.info(f"WebRTC: offer received from {caller_id}")
+                        break  # We have the offer, proceed
+
+                if not offer_sdp:
+                    logger.warning("WebRTC: no offer received")
+                    return
+
+                # Get SDP answer from go2rtc (runs in executor to avoid blocking)
+                loop = asyncio.get_event_loop()
+                answer_sdp = await loop.run_in_executor(
+                    None, self._post_offer_to_go2rtc, offer_sdp
+                )
+                if not answer_sdp:
+                    logger.warning("WebRTC: go2rtc did not return an answer")
+                    return
+
+                answer_msg = json.dumps({
+                    "action": "ice_msg",
+                    "from": self.device_sn,
+                    "to": caller_id,
+                    "sdpMessage": {
+                        "type": "answer",
+                        "data": {"type": "answer", "sdp": answer_sdp},
+                    },
+                })
+                logger.info(f"WebRTC: sending answer ({len(answer_sdp)} bytes) to {caller_id}")
+                await ws.send(answer_msg)
+                logger.info(f"WebRTC: answer sent successfully")
+
+                # Keep WebSocket alive to receive any follow-up messages
+                # (not strictly needed but polite)
+                try:
+                    async for _ in ws:
+                        pass
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"WebRTC signaling error: {e}")
+
+    def start(self, on_done=None):
+        """Run signaling in a daemon thread with its own event loop."""
+        def _thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._run_async())
+            except Exception as e:
+                logger.error(f"WebRTC thread error: {e}")
+            finally:
+                loop.close()
+                if on_done:
+                    on_done()
+
+        t = threading.Thread(target=_thread, daemon=True, name="webrtc-bridge")
+        t.start()
+
+
+def _decode_jwt_sub(jwt_token):
+    """Decode JWT payload (no signature verification) and return sub field."""
+    try:
+        parts = jwt_token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1]
+        # Add padding
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("sub")
+    except Exception as e:
+        logger.warning(f"JWT decode failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 #  State mapper
 # ─────────────────────────────────────────────
 # Creality state values:
@@ -326,6 +494,11 @@ class CrealityKlipperPlugin:
         self.device_secret = config.get("deviceSecret")
         self.region = config.get("region", 1)
 
+        from urllib.parse import urlparse
+        moonraker_url = config.get("moonraker_url", "http://localhost:7125")
+        self._printer_ip = urlparse(moonraker_url).hostname or ""
+        self._has_camera = int(bool(config.get("camera_port", 0)))
+
         self._tb_host = "mqtt.crealitycloud.cn" if self.region == 0 else "mqtt.crealitycloud.com"
         self.client = None
         self._connected = False
@@ -350,6 +523,14 @@ class CrealityKlipperPlugin:
         self._dProgress = 0
         self._model = config.get("model", "Klipper Printer")
         self._is_cloud_print = False
+
+        # WebRTC camera state
+        self._go2rtc_url = config.get("go2rtc_url", "http://localhost:1984")
+        self._webrtc_stream = config.get("webrtc_stream", "")
+        self._webrtc_bridge = None
+        self._token_path = config.path.replace(".json", "_token.json")
+        # Load persisted token from last session
+        self._jwt_token, self._device_sn = self._load_token()
 
         # Pending MQTT messages
         self._telemetry_msg = {}
@@ -404,6 +585,24 @@ class CrealityKlipperPlugin:
             except Exception:
                 pass
 
+    # ── Token persistence ─────────────────────
+    def _load_token(self):
+        try:
+            if os.path.exists(self._token_path):
+                with open(self._token_path) as f:
+                    d = json.load(f)
+                return d.get("jwt_token"), d.get("device_sn")
+        except Exception:
+            pass
+        return None, None
+
+    def _save_token(self):
+        try:
+            with open(self._token_path, "w") as f:
+                json.dump({"jwt_token": self._jwt_token, "device_sn": self._device_sn}, f)
+        except Exception as e:
+            logger.warning(f"Could not save token: {e}")
+
     # ── ThingsBoard connection ─────────────────
     def connect(self):
         logger.info(f"Connecting to ThingsBoard at {self._tb_host} as {self.device_name}")
@@ -418,6 +617,10 @@ class CrealityKlipperPlugin:
             self._send_initial_attributes()
             time.sleep(1)
             self._start_timers()
+            # Start WebRTC standby if we have a persisted token and no bridge yet
+            if self._webrtc_stream and self._jwt_token and self._device_sn and not self._webrtc_bridge:
+                logger.info(f"WebRTC: using persisted token for sn={self._device_sn}")
+                self._start_webrtc_standby()
         except Exception as e:
             logger.error(f"Connection failed: {e}")
             self._connected = False
@@ -434,7 +637,6 @@ class CrealityKlipperPlugin:
 
     def _send_initial_attributes(self):
         """Send initial state so the app sees the printer immediately."""
-        ip = self.moonraker.get_ip_address()
         attrs = {
             "printStartTime": " ",
             "layer": 0,
@@ -444,13 +646,13 @@ class CrealityKlipperPlugin:
             "curPosition": " ",
             "printId": " ",
             "filename": " ",
-            "video": 0,
-            "netIP": ip,
+            "video": self._has_camera,
+            "netIP": self._printer_ip,
             "state": 0,
             "tfCard": 1,
             "model": self._model,
             "mcu_is_print": 0,
-            "boxVersion": config.get("box_version", "rasp_v2.01b99"),
+            "boxVersion": self.config.get("box_version", "rasp_v2.5.0"),
             "InitString": " ",
             "APILicense": " ",
             "DIDString": " ",
@@ -788,6 +990,39 @@ class CrealityKlipperPlugin:
             logger.info(f"LED set to {v}")
             self._attributes_msg["led_state"] = v
 
+        elif prop == "pullclient":
+            # App is requesting camera stream
+            if self._webrtc_stream and self._jwt_token and self._device_sn:
+                # WebRTC mode: bridge should already be in standby; start new one if not
+                logger.info(f"WebRTC pullclient from {value}, bridge standby={self._webrtc_bridge is not None}")
+                if not self._webrtc_bridge:
+                    self._start_webrtc_standby()
+                # Acknowledge pullclient
+                self._send_attributes({"livestream": 1, "pullclient": str(value)})
+            elif self._has_camera:
+                # MJPEG fallback: respond with stream URL
+                camera_port = self.config.get("camera_port", 8080)
+                stream_url = f"http://{self._printer_ip}:{camera_port}/?action=stream"
+                self._send_attributes({
+                    "livestream": 1,
+                    "pullclient": str(value),
+                    "liveUrl": stream_url,
+                    "mjpegUrl": stream_url,
+                })
+                logger.info(f"Camera MJPEG stream requested, responding with {stream_url}")
+            else:
+                logger.info("pullclient received but no camera configured")
+
+        elif prop == "livestream":
+            # Only respond to standalone livestream:1 (app opening camera)
+            # In WebRTC mode: just ack, the app will send pullclient separately
+            # In MJPEG mode: respond with stream URL
+            v = int(value)
+            if v == 1 and self._has_camera and not self._webrtc_stream:
+                camera_port = self.config.get("camera_port", 8080)
+                stream_url = f"http://{self._printer_ip}:{camera_port}/?action=stream"
+                self._send_attributes({"livestream": 1, "liveUrl": stream_url})
+
         elif prop == "autohome":
             self.moonraker.home_axes()
             self._attributes_msg["autohome"] = 1
@@ -800,8 +1035,19 @@ class CrealityKlipperPlugin:
             self._send_attributes({"retGcodeFileInfo": "[]"})
 
         elif prop in ("jwtToken", "token"):
-            # Creality Cloud session token refresh - acknowledge and ignore
-            logger.info("jwtToken refresh received, acknowledging")
+            # Store JWT token for WebRTC signaling; extract device SN from payload
+            self._jwt_token = str(value)
+            sn = _decode_jwt_sub(self._jwt_token)
+            if sn:
+                self._device_sn = sn
+                self._save_token()
+                logger.info(f"jwtToken received, device_sn={sn}")
+                # Pre-connect to WebRTC signaling server if camera is configured
+                if self._webrtc_stream:
+                    self._webrtc_bridge = None  # Reset so new bridge is started
+                    self._start_webrtc_standby()
+            else:
+                logger.info("jwtToken received (could not decode sn)")
 
         elif prop == "printId":
             self._print_id = value
@@ -865,7 +1111,8 @@ class CrealityKlipperPlugin:
             "stop":          self._stop,
             "fan":           0,
             "model":         self._model,
-            "netIP":         self.moonraker.get_ip_address(),
+            "netIP":         self._printer_ip,
+            "video":         self._has_camera,
             "layer":         self._layer,
             "filename":      self._filename,
             "printId":       self._print_id,
@@ -885,6 +1132,29 @@ class CrealityKlipperPlugin:
             self._state = state
             self._attributes_msg["state"] = state
             self._save_session()
+
+    def _start_webrtc_standby(self):
+        """Connect to Creality WebRTC signaling immediately after receiving jwtToken.
+        The bridge connects and waits for an SDP offer (from pullclient)."""
+        if not self._webrtc_stream or not self._jwt_token or not self._device_sn:
+            return
+        bridge = CrealityWebRTCBridge(
+            jwt_token=self._jwt_token,
+            device_sn=self._device_sn,
+            go2rtc_url=self._go2rtc_url,
+            stream_name=self._webrtc_stream,
+            region=self.region,
+            app_version=self.config.get("box_version", "1.3.3.46"),
+            model=self._model,
+        )
+        self._webrtc_bridge = bridge
+
+        def _on_bridge_done():
+            logger.info("WebRTC bridge finished, clearing bridge reference")
+            self._webrtc_bridge = None
+
+        bridge.start(on_done=_on_bridge_done)
+        logger.info(f"WebRTC standby started for sn={self._device_sn}")
 
     # ── File handling ──────────────────────────
     def _handle_op_gcode_file(self, value):
