@@ -1,7 +1,7 @@
 # Creality Cloud - Klipper Plugin
 
 Connects your Klipper-based printer directly to Creality Cloud,
-without OctoPrint. Built for CR10S Pro, CR10S Pro V2, and CR-X Pro.
+without OctoPrint. Built for CR10S Pro, CR10S Pro V2, CR-X Pro, and CR-K1/K1C.
 
 ## How it works
 
@@ -107,11 +107,12 @@ journalctl -u creality-klipper -f
 | Print progress reporting | ✅ |
 | Print time remaining | ✅ |
 | LED control | ✅ Requires `[output_pin LED]` in printer.cfg |
-| Video streaming | ⚠️ Experimental, see below |
+| Video streaming (Fluidd) | ✅ Via go2rtc, see below |
+| Video streaming (Creality Cloud app, K1C) | ✅ WebRTC via go2rtc, see below |
 
-## Video streaming (Fluidd / local network)
+## Video streaming
 
-IP cameras (e.g. Tapo C100) can be bridged to Fluidd using [go2rtc](https://github.com/AlexxIT/go2rtc), which transcodes RTSP → MJPEG.
+Both Fluidd (local network) and the Creality Cloud app (WebRTC) are supported via [go2rtc](https://github.com/AlexxIT/go2rtc).
 
 ### 1. Download go2rtc
 
@@ -129,14 +130,29 @@ api:
 
 ffmpeg:
   bin: ffmpeg
+  # Required for Creality Cloud app WebRTC: encode H264 Baseline so the
+  # app's decoder can handle it. Without this, go2rtc uses High Profile
+  # and the app shows a frozen still instead of live video.
+  h264: "-c:v libx264 -g:v 30 -profile:v baseline -level:v 3.1 -preset:v superfast -tune:v zerolatency -pix_fmt:v yuv420p -an"
 
 streams:
+  # IP camera (e.g. Tapo C100) — RTSP to MJPEG for Fluidd
   my_camera:
     - rtsp://user:password@192.168.x.x:554/stream1
     - "ffmpeg:my_camera#video=mjpeg"
+
+  # K1C built-in USB camera — MJPEG to H264 for WebRTC
+  camera_K1C:
+    - http://<k1c-ip>:8080/?action=stream
+    - "ffmpeg:camera_K1C#video=h264"
+
+webrtc:
+  listen: :8555
+  candidates:
+    - <pi-ip>
 ```
 
-Add one entry per camera. The `ffmpeg` transcoding line is required because Tapo cameras stream H264, not MJPEG.
+Add one stream entry per camera. The `ffmpeg` transcoding line converts the source to the required format.
 
 ### 3. Install as a systemd service
 
@@ -167,7 +183,23 @@ In Fluidd go to **Settings → Webcams → Add webcam**:
 - Stream type: **MJPEG Stream**
 - URL: `http://<pi-ip>:1984/api/stream.mjpeg?src=my_camera`
 
-> Note: Video streaming in the Creality Cloud app requires Creality's proprietary relay infrastructure and is not currently supported.
+### 5. Creality Cloud app (K1C WebRTC)
+
+For K1C, add `webrtc_stream` to your config.json:
+
+```json
+{
+  "webrtc_stream": "camera_K1C",
+  "camera_port": 8080
+}
+```
+
+When you open the camera in the Creality Cloud app, the plugin handles the WebRTC signaling automatically — no extra setup needed. The plugin:
+- Receives the per-session TURN credentials from Creality's signaling server
+- Updates go2rtc with those credentials for NAT traversal
+- Bridges the WebRTC offer/answer between the app and go2rtc
+
+> Note: Also install `pyyaml` in the plugin virtualenv (`pip install pyyaml`) as it is required for dynamic TURN config updates.
 
 ## Logs
 
