@@ -299,6 +299,54 @@ class MoonrakerClient:
         return info.get("result", {}).get("state") == "ready"
 
 
+def _update_go2rtc_turn(config_path, ice_servers):
+    """Update go2rtc.yaml with TURN credentials and restart go2rtc if config changed."""
+    import yaml, subprocess
+    if not ice_servers:
+        return
+    if isinstance(ice_servers, dict):
+        ice_servers = [ice_servers]
+
+    # Build go2rtc ice_servers list
+    go2rtc_ice = []
+    for s in ice_servers:
+        urls = s.get("urls", "")
+        entry = {"urls": [urls] if isinstance(urls, str) else list(urls)}
+        if "username" in s:
+            entry["username"] = s["username"]
+        if "credential" in s:
+            entry["credential"] = s["credential"]
+        go2rtc_ice.append(entry)
+
+    try:
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning(f"WebRTC: could not read go2rtc config: {e}")
+        return
+
+    # Compare by username to detect credential rotation
+    def _cred_key(e):
+        return (str(e.get("urls", "")), e.get("username", ""))
+
+    current_ice = config.get("webrtc", {}).get("ice_servers", [])
+    if current_ice and [_cred_key(e) for e in current_ice] == [_cred_key(e) for e in go2rtc_ice]:
+        logger.info("WebRTC: go2rtc TURN credentials unchanged")
+        return
+
+    config.setdefault("webrtc", {})["ice_servers"] = go2rtc_ice
+    try:
+        with open(config_path, "w") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+        logger.info(f"WebRTC: updated go2rtc TURN config, restarting go2rtc")
+        subprocess.run(["sudo", "systemctl", "restart", "go2rtc"],
+                       check=True, timeout=10, capture_output=True)
+        time.sleep(2)
+        logger.info("WebRTC: go2rtc restarted with TURN config")
+    except Exception as e:
+        logger.warning(f"WebRTC: failed to update go2rtc TURN config: {e}")
+
+
 # ─────────────────────────────────────────────
 #  WebRTC bridge (Creality signaling ↔ go2rtc)
 # ─────────────────────────────────────────────
@@ -320,7 +368,8 @@ class CrealityWebRTCBridge:
     SIGNALING_PATH = "/api/cxy/ws/webrtc/signal/push/{sn}"
 
     def __init__(self, jwt_token, device_sn, go2rtc_url, stream_name,
-                 region=1, app_version="1.3.3.46", model="CR-K1"):
+                 region=1, app_version="1.3.3.46", model="CR-K1",
+                 go2rtc_config_path="/home/erwin/go2rtc.yaml"):
         self.jwt_token = jwt_token
         self.device_sn = device_sn
         self.go2rtc_url = go2rtc_url
@@ -328,6 +377,7 @@ class CrealityWebRTCBridge:
         self.region = region
         self.app_version = app_version
         self.model = model
+        self.go2rtc_config_path = go2rtc_config_path
 
     def _ws_url(self):
         host = self.SIGNALING_HOST_CN if self.region == 0 else self.SIGNALING_HOST_INT
@@ -349,6 +399,73 @@ class CrealityWebRTCBridge:
             "token": {"jwtToken": self.jwt_token},
         })
 
+    def _inject_candidates(self, sdp, candidates):
+        """Inject trickle ICE candidates into SDP (at end of each m= section)."""
+        lines = sdp.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n")
+        candidate_lines = []
+        for c in candidates:
+            candidate_lines.append(c if c.startswith("a=") else f"a={c}")
+
+        result = []
+        in_media = False
+        for line in lines:
+            if line.startswith("m="):
+                if in_media:
+                    result.extend(candidate_lines)
+                in_media = True
+            result.append(line)
+        if in_media:
+            result.extend(candidate_lines)
+
+        return "\r\n".join(result) + "\r\n"
+
+    def _clean_answer_sdp(self, sdp):
+        """Remove component-2 and duplicate candidates from go2rtc's answer.
+        If stale-ufrag filtering would leave 0 candidates, fall back to keeping all
+        component-1 candidates so the phone at least has something to connect to."""
+        lines = sdp.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n").split("\n")
+        session_ufrag = None
+        for line in lines:
+            if line.startswith("a=ice-ufrag:"):
+                session_ufrag = line.split(":", 1)[1].strip()
+                break
+
+        def _filter(require_ufrag_match):
+            seen = set()
+            result = []
+            for line in lines:
+                if line.startswith("a=candidate:"):
+                    parts = line.split()
+                    if len(parts) < 8:
+                        continue
+                    if parts[1] != "1":  # Skip component 2 (RTCP-mux)
+                        continue
+                    if require_ufrag_match and session_ufrag:
+                        if "ufrag" not in parts:
+                            continue
+                        idx = parts.index("ufrag")
+                        cand_ufrag = parts[idx + 1] if idx + 1 < len(parts) else None
+                        if cand_ufrag != session_ufrag:
+                            continue
+                    key = (parts[2], parts[4], parts[5], parts[7])  # transport, addr, port, type
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                result.append(line)
+            return result
+
+        # Try strict filtering first (matching ufrag only)
+        result = _filter(require_ufrag_match=True)
+        kept = sum(1 for l in result if l.startswith("a=candidate:"))
+        if kept == 0:
+            # Fall back: keep all component-1 candidates regardless of ufrag
+            result = _filter(require_ufrag_match=False)
+            kept = sum(1 for l in result if l.startswith("a=candidate:"))
+            logger.info(f"WebRTC: answer using fallback candidates ({kept} total)")
+        else:
+            logger.info(f"WebRTC: answer cleaned to {kept} fresh candidates")
+        return "\r\n".join(result) + "\r\n"
+
     def _post_offer_to_go2rtc(self, offer_sdp):
         """POST SDP offer to go2rtc, return SDP answer string or None."""
         try:
@@ -359,7 +476,7 @@ class CrealityWebRTCBridge:
                               timeout=20)
             logger.info(f"go2rtc response: status={r.status_code} len={len(r.text)}")
             if r.status_code in (200, 201) and r.text.strip().startswith("v="):
-                return r.text
+                return self._clean_answer_sdp(r.text)
             logger.error(f"go2rtc error {r.status_code}: {r.text[:200]}")
         except Exception as e:
             logger.error(f"go2rtc offer POST failed: {e}")
@@ -389,15 +506,47 @@ class CrealityWebRTCBridge:
 
                     if action == "ice_msg" and sdp_type == "offer":
                         offer_sdp = sdp_msg["data"]["sdp"]
-                        logger.info(f"WebRTC: offer received from {caller_id}")
+                        ice_servers = msg.get("iceServers", [])
+                        logger.info(f"WebRTC: offer received from {caller_id}, iceServers={json.dumps(ice_servers)}")
                         break  # We have the offer, proceed
 
                 if not offer_sdp:
                     logger.warning("WebRTC: no offer received")
                     return
 
-                # Get SDP answer from go2rtc (runs in executor to avoid blocking)
+                # Start TURN config update in background (runs in parallel with candidate collection)
                 loop = asyncio.get_event_loop()
+                turn_future = loop.run_in_executor(
+                    None, _update_go2rtc_turn, self.go2rtc_config_path, ice_servers
+                )
+
+                # Collect trickle ICE candidates for 2 seconds
+                ice_candidates = []
+                try:
+                    async with asyncio.timeout(2.0):
+                        async for raw2 in ws:
+                            try:
+                                msg2 = json.loads(raw2)
+                            except Exception:
+                                continue
+                            sdp2 = msg2.get("sdpMessage", {})
+                            if sdp2.get("type") == "candidate":
+                                cand = sdp2.get("data", {}).get("candidate", "")
+                                if cand:
+                                    ice_candidates.append(cand)
+                                    logger.debug(f"WebRTC: phone offer cand: {cand}")
+                except asyncio.TimeoutError:
+                    pass
+                logger.info(f"WebRTC: collected {len(ice_candidates)} trickle candidates")
+
+                # Inject collected candidates into the offer SDP
+                if ice_candidates:
+                    offer_sdp = self._inject_candidates(offer_sdp, ice_candidates)
+
+                # Wait for TURN config update to finish before POSTing to go2rtc
+                await turn_future
+
+                # Get SDP answer from go2rtc (runs in executor to avoid blocking)
                 answer_sdp = await loop.run_in_executor(
                     None, self._post_offer_to_go2rtc, offer_sdp
                 )
@@ -414,15 +563,42 @@ class CrealityWebRTCBridge:
                         "data": {"type": "answer", "sdp": answer_sdp},
                     },
                 })
-                logger.info(f"WebRTC: sending answer ({len(answer_sdp)} bytes) to {caller_id}")
+                logger.info(f"WebRTC: sending answer to {caller_id}")
                 await ws.send(answer_msg)
                 logger.info(f"WebRTC: answer sent successfully")
 
-                # Keep WebSocket alive to receive any follow-up messages
-                # (not strictly needed but polite)
+                # Send go2rtc's ICE candidates as trickle ICE messages
+                # (native K1C firmware sends candidates this way, not just inline)
+                for line in answer_sdp.replace("\r\n", "\n").split("\n"):
+                    if line.startswith("a=candidate:"):
+                        cand_val = line[2:]  # strip "a="
+                        trickle_msg = json.dumps({
+                            "action": "ice_msg",
+                            "from": self.device_sn,
+                            "to": caller_id,
+                            "sdpMessage": {
+                                "type": "candidate",
+                                "data": {"candidate": cand_val, "sdpMLineIndex": 0},
+                            },
+                        })
+                        await ws.send(trickle_msg)
+                        logger.info(f"WebRTC: sent trickle candidate: {cand_val[:60]}")
+
+                # Keep WebSocket alive — log phone's follow-up candidates and re-offers
                 try:
-                    async for _ in ws:
-                        pass
+                    async for raw3 in ws:
+                        try:
+                            msg3 = json.loads(raw3)
+                        except Exception:
+                            continue
+                        sdp3 = msg3.get("sdpMessage", {})
+                        t3 = sdp3.get("type", "")
+                        if t3 == "candidate":
+                            cand = sdp3.get("data", {}).get("candidate", "")
+                            if cand:
+                                logger.info(f"WebRTC: phone trickle: {cand}")
+                        elif t3 == "offer":
+                            logger.info(f"WebRTC: re-offer from phone (bridge will restart on next token)")
                 except Exception:
                     pass
 
@@ -506,6 +682,7 @@ class CrealityKlipperPlugin:
         # Internal state cache
         self._state = -1          # -1 = not yet read from Moonraker
         self._state_known = False # True after first collect tick
+        self._preparing_print = False  # True during download/calibrate, before actual print starts
         self._pause = 0
         self._stop = 0
         self._print_progress = 0
@@ -754,7 +931,8 @@ class CrealityKlipperPlugin:
             self._attributes_msg["state"] = creality_state
             # If we were printing and now we're idle/standby, treat as complete
             grace = getattr(self, "_ignore_complete_until", 0)
-            if prev_state == 1 and creality_state == 0 and time.time() > grace:
+            if (prev_state == 1 and creality_state == 0
+                    and time.time() > grace and not self._preparing_print):
                 self._state = 2
                 self._attributes_msg["state"] = 2
                 self._telemetry_msg["printProgress"] = 100
@@ -923,7 +1101,8 @@ class CrealityKlipperPlugin:
             # Record print start time and set grace period
             self._print_start_time = int(time.time())
             self._attributes_msg["printStartTime"] = self._print_start_time
-            self._ignore_complete_until = time.time() + 30  # 30 second grace period
+            self._ignore_complete_until = time.time() + 30  # short grace while thread starts
+            self._preparing_print = True
             t = threading.Thread(target=self._process_file_request, args=(str(value),))
             t.daemon = True
             t.start()
@@ -1043,8 +1222,7 @@ class CrealityKlipperPlugin:
                 self._save_token()
                 logger.info(f"jwtToken received, device_sn={sn}")
                 # Pre-connect to WebRTC signaling server if camera is configured
-                if self._webrtc_stream:
-                    self._webrtc_bridge = None  # Reset so new bridge is started
+                if self._webrtc_stream and not self._webrtc_bridge:
                     self._start_webrtc_standby()
             else:
                 logger.info("jwtToken received (could not decode sn)")
@@ -1233,8 +1411,9 @@ class CrealityKlipperPlugin:
                 except Exception:
                     self._auto_bed_level = bool(self.config.get("auto_bed_level", False))
 
-            # Start printing — reset grace period now that print is actually starting
-            self._ignore_complete_until = time.time() + 60
+            # Start printing — preparation phase is done, print is actually starting
+            self._preparing_print = False
+            self._ignore_complete_until = time.time() + 120  # 2 min grace for startup gcode
             time.sleep(1)
             self.moonraker.start_print(local_filename)
 
@@ -1256,6 +1435,7 @@ class CrealityKlipperPlugin:
 
         except Exception as e:
             logger.error(f"File download/print failed: {e}")
+            self._preparing_print = False
             self._set_state(3)
             self._attributes_msg["err"] = 2  # DOWNLOAD_FAIL
 
