@@ -899,7 +899,9 @@ class CrealityKlipperPlugin:
         self._go2rtc_url = config.get("go2rtc_url", "http://localhost:1984")
         self._webrtc_stream = config.get("webrtc_stream", "")
         self._webrtc_bridge = None
-        self._token_path = config.path.replace(".json", "_token.json")
+        _state_dir = os.path.dirname(config.path)
+        _name = os.path.basename(config.path).replace("config-", "").replace(".json", "")
+        self._token_path = os.path.join(_state_dir, f"state-{_name}_token.json")
         # Load persisted token from last session
         self._jwt_token, self._device_sn = self._load_token()
 
@@ -914,7 +916,7 @@ class CrealityKlipperPlugin:
         self._iot_timer = None
 
         # Session file — persists printId across restarts
-        self._session_path = config.path.replace(".json", "_session.json")
+        self._session_path = os.path.join(_state_dir, f"state-{_name}_session.json")
 
     # ── Session persistence ────────────────────
     def _save_session(self):
