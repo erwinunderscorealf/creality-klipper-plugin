@@ -108,7 +108,7 @@ journalctl -u creality-klipper -f
 | Print time remaining | ✅ |
 | LED control | ✅ Requires `[output_pin LED]` in printer.cfg |
 | Video streaming (Fluidd) | ✅ Via go2rtc, see below |
-| Video streaming (Creality Cloud app, K1C) | ✅ WebRTC via go2rtc, see below |
+| Video streaming (Creality Cloud app, K1C) | ✅ WebRTC via go2rtc, see below ⚠️ |
 
 ## Video streaming
 
@@ -200,6 +200,14 @@ When you open the camera in the Creality Cloud app, the plugin handles the WebRT
 - Bridges the WebRTC offer/answer between the app and go2rtc
 
 > Note: Also install `pyyaml` in the plugin virtualenv (`pip install pyyaml`) as it is required for dynamic TURN config updates.
+
+## Known limitations
+
+**WebRTC camera: close + reopen shows hourglass (Creality Cloud app bug)**
+
+After watching the camera stream in the app, closing and reopening it in the same app session results in a perpetual hourglass — no video loads. This is a **Creality Cloud platform bug**, not a plugin issue. It affects all Creality printers including factory-stock devices (confirmed on an unmodified K2).
+
+**Workaround:** fully close and reopen the Creality Cloud app. The first time you open the camera after that, video works.
 
 ## Logs
 

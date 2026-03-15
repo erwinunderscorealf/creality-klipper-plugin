@@ -338,11 +338,11 @@ def _update_go2rtc_turn(config_path, ice_servers):
     try:
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
-        logger.info(f"WebRTC: updated go2rtc TURN config, restarting go2rtc")
-        subprocess.run(["sudo", "systemctl", "restart", "go2rtc"],
-                       check=True, timeout=10, capture_output=True)
-        time.sleep(2)
-        logger.info("WebRTC: go2rtc restarted with TURN config")
+        # Don't restart go2rtc — a restart kills the ffmpeg transcoder and takes 2+ seconds,
+        # during which port 8555 is down and the phone's ICE connectivity checks fail.
+        # go2rtc will pick up the new TURN credentials on its next restart (e.g. reboot).
+        # On LAN the host candidate (192.168.68.146:8555) is sufficient without TURN.
+        logger.info("WebRTC: updated go2rtc TURN config (no restart needed for LAN)")
     except Exception as e:
         logger.warning(f"WebRTC: failed to update go2rtc TURN config: {e}")
 
@@ -378,11 +378,23 @@ class CrealityWebRTCBridge:
         self.app_version = app_version
         self.model = model
         self.go2rtc_config_path = go2rtc_config_path
+        self._stopped = False
+        self._ws = None
+        self._loop = None
 
     def _ws_url(self):
         host = self.SIGNALING_HOST_CN if self.region == 0 else self.SIGNALING_HOST_INT
         path = self.SIGNALING_PATH.format(sn=self.device_sn)
         return f"wss://{host}{path}"
+
+    def stop(self):
+        """Signal the bridge to stop and close the WebSocket."""
+        self._stopped = True
+        if self._ws and self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+            except Exception:
+                pass
 
     def _join_msg(self):
         return json.dumps({
@@ -476,140 +488,322 @@ class CrealityWebRTCBridge:
                               timeout=20)
             logger.info(f"go2rtc response: status={r.status_code} len={len(r.text)}")
             if r.status_code in (200, 201) and r.text.strip().startswith("v="):
-                return self._clean_answer_sdp(r.text)
+                raw = r.text
+                for line in raw.replace("\r\n", "\n").split("\n"):
+                    if line.startswith("a=ice-ufrag:") or line.startswith("a=ice-pwd:"):
+                        logger.info(f"go2rtc raw answer: {line.strip()}")
+                        break
+                return self._clean_answer_sdp(raw)
             logger.error(f"go2rtc error {r.status_code}: {r.text[:200]}")
         except Exception as e:
             logger.error(f"go2rtc offer POST failed: {e}")
         return None
 
+    def update_token(self, jwt_token):
+        """Update JWT token and send a re-join on the existing WebSocket.
+        Sending re-join immediately (without closing) tells the server to reset
+        its routing state so it will deliver the phone's next offer to us.
+        The phone sends its offer within 0.1-0.5 s of the token — closing and
+        reconnecting creates a gap during which the offer is lost.  With re-join
+        the offer arrives in the current connection's drain/wait loop, is saved as
+        pending_offer, and is then processed on a fresh reconnected connection so
+        the server forwards the answer to the phone."""
+        self.jwt_token = jwt_token
+        if self._ws and self._loop:
+            async def _rejoin():
+                try:
+                    await self._ws.send(self._join_msg())
+                    logger.info("WebRTC: sent re-join to reset server routing state")
+                except Exception as e:
+                    logger.debug(f"WebRTC: re-join failed: {e}")
+            try:
+                asyncio.run_coroutine_threadsafe(_rejoin(), self._loop)
+            except Exception:
+                pass
+
     async def _run_async(self):
+        """Signaling loop.
+
+        Two-connection strategy per session
+        ────────────────────────────────────
+        Connection A  (offer collection)
+          • update_token() sends a re-join immediately so the server resets its
+            routing state and delivers the phone's offer without any gap.
+          • Offer + trickle ICE candidates are collected here.
+        Connection B  (answer delivery)
+          • We reconnect immediately after collecting the offer.
+          • Answer is sent on this freshly-joined connection.
+          • The server only forwards answers on freshly-joined connections
+            (confirmed: tcpdump shows zero STUN when answer sent on reused WS).
+          • Drain also runs here; if a re-offer arrives, trickle is collected and
+            the cycle repeats: reconnect → connection C for next answer.
+        """
         import websockets as _ws
         ws_url = self._ws_url()
-        logger.info(f"WebRTC: connecting to {ws_url}")
-        try:
-            async with _ws.connect(ws_url, ssl=True) as ws:
-                await ws.send(self._join_msg())
-                logger.info(f"WebRTC: join sent for sn={self.device_sn}")
+        loop = asyncio.get_event_loop()
 
-                offer_sdp = None
-                caller_id = None
+        # Offer (with trickle already injected) saved from connection A/drain.
+        # Will be answered on the next fresh connection.
+        pending_offer = None  # (offer_sdp, caller_id, ice_servers)
 
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-                    action = msg.get("action", "")
-                    sdp_msg = msg.get("sdpMessage", {})
-                    sdp_type = sdp_msg.get("type", "")
-                    caller_id = msg.get("from", caller_id)
+        while not self._stopped:
+            logger.info(f"WebRTC: connecting to {ws_url}")
+            try:
+                async with _ws.connect(ws_url, ssl=True) as ws:
+                    self._ws = ws
+                    if self._stopped:
+                        return
+                    await ws.send(self._join_msg())
+                    logger.info(f"WebRTC: join sent for sn={self.device_sn}")
 
-                    if action == "ice_msg" and sdp_type == "offer":
-                        offer_sdp = sdp_msg["data"]["sdp"]
-                        ice_servers = msg.get("iceServers", [])
-                        logger.info(f"WebRTC: offer received from {caller_id}, iceServers={json.dumps(ice_servers)}")
-                        break  # We have the offer, proceed
+                    if pending_offer is not None:
+                        # ── Answer connection (B / C / …) ────────────────────────
+                        # Offer was collected on the previous connection; answer
+                        # on this fresh one so the server will forward it.
+                        # Wait for join ACK before sending answer — server must
+                        # finish registering our connection before routing our answer.
+                        offer_sdp, caller_id, ice_servers = pending_offer
+                        pending_offer = None
+                        logger.info(f"WebRTC: answering saved offer from {caller_id} on fresh connection")
 
-                if not offer_sdp:
-                    logger.warning("WebRTC: no offer received")
-                    return
+                        # Wait for join ACK from server (action=join from=server)
+                        try:
+                            async with asyncio.timeout(5.0):
+                                async for raw_join in ws:
+                                    try:
+                                        msg_join = json.loads(raw_join)
+                                    except Exception:
+                                        continue
+                                    if msg_join.get("action") == "join" and msg_join.get("from") == "server":
+                                        logger.info("WebRTC: join ACK received, server ready")
+                                        break
+                                    logger.info(f"WebRTC: pre-answer msg: {msg_join.get('action')} from={msg_join.get('from','?')[:20]}")
+                        except asyncio.TimeoutError:
+                            logger.warning("WebRTC: join ACK timeout, sending answer anyway")
 
-                # Start TURN config update in background (runs in parallel with candidate collection)
-                loop = asyncio.get_event_loop()
-                turn_future = loop.run_in_executor(
-                    None, _update_go2rtc_turn, self.go2rtc_config_path, ice_servers
-                )
+                        await loop.run_in_executor(
+                            None, _update_go2rtc_turn, self.go2rtc_config_path, ice_servers
+                        )
+                        answer_sdp = await loop.run_in_executor(
+                            None, self._post_offer_to_go2rtc, offer_sdp
+                        )
+                        if not answer_sdp:
+                            logger.warning("WebRTC: go2rtc did not return an answer")
+                            if not self._stopped:
+                                await asyncio.sleep(1)
+                            continue
 
-                # Collect trickle ICE candidates for 2 seconds
-                ice_candidates = []
-                try:
-                    async with asyncio.timeout(2.0):
-                        async for raw2 in ws:
-                            try:
-                                msg2 = json.loads(raw2)
-                            except Exception:
-                                continue
-                            sdp2 = msg2.get("sdpMessage", {})
-                            if sdp2.get("type") == "candidate":
-                                cand = sdp2.get("data", {}).get("candidate", "")
-                                if cand:
-                                    ice_candidates.append(cand)
-                                    logger.debug(f"WebRTC: phone offer cand: {cand}")
-                except asyncio.TimeoutError:
-                    pass
-                logger.info(f"WebRTC: collected {len(ice_candidates)} trickle candidates")
-
-                # Inject collected candidates into the offer SDP
-                if ice_candidates:
-                    offer_sdp = self._inject_candidates(offer_sdp, ice_candidates)
-
-                # Wait for TURN config update to finish before POSTing to go2rtc
-                await turn_future
-
-                # Get SDP answer from go2rtc (runs in executor to avoid blocking)
-                answer_sdp = await loop.run_in_executor(
-                    None, self._post_offer_to_go2rtc, offer_sdp
-                )
-                if not answer_sdp:
-                    logger.warning("WebRTC: go2rtc did not return an answer")
-                    return
-
-                answer_msg = json.dumps({
-                    "action": "ice_msg",
-                    "from": self.device_sn,
-                    "to": caller_id,
-                    "sdpMessage": {
-                        "type": "answer",
-                        "data": {"type": "answer", "sdp": answer_sdp},
-                    },
-                })
-                logger.info(f"WebRTC: sending answer to {caller_id}")
-                await ws.send(answer_msg)
-                logger.info(f"WebRTC: answer sent successfully")
-
-                # Send go2rtc's ICE candidates as trickle ICE messages
-                # (native K1C firmware sends candidates this way, not just inline)
-                for line in answer_sdp.replace("\r\n", "\n").split("\n"):
-                    if line.startswith("a=candidate:"):
-                        cand_val = line[2:]  # strip "a="
-                        trickle_msg = json.dumps({
+                        await ws.send(json.dumps({
                             "action": "ice_msg",
                             "from": self.device_sn,
                             "to": caller_id,
                             "sdpMessage": {
-                                "type": "candidate",
-                                "data": {"candidate": cand_val, "sdpMLineIndex": 0},
+                                "type": "answer",
+                                "data": {"type": "answer", "sdp": answer_sdp},
                             },
-                        })
-                        await ws.send(trickle_msg)
-                        logger.info(f"WebRTC: sent trickle candidate: {cand_val[:60]}")
+                        }))
+                        logger.info(f"WebRTC: answer sent on fresh connection to {caller_id}")
 
-                # Keep WebSocket alive — log phone's follow-up candidates and re-offers
-                try:
-                    async for raw3 in ws:
+                        for line in answer_sdp.replace("\r\n", "\n").split("\n"):
+                            if line.startswith("a=candidate:"):
+                                cand_val = line[2:]
+                                await ws.send(json.dumps({
+                                    "action": "ice_msg",
+                                    "from": self.device_sn,
+                                    "to": caller_id,
+                                    "sdpMessage": {
+                                        "type": "candidate",
+                                        "data": {"candidate": cand_val, "sdpMLineIndex": 0},
+                                    },
+                                }))
+                                logger.info(f"WebRTC: sent trickle candidate: {cand_val[:60]}")
+
+                        # ── Drain ─────────────────────────────────────────────────
+                        # After answering, drain for up to 5 seconds then proactively
+                        # reconnect to a fresh connection.  The fresh connection becomes
+                        # the new "offer collection" connection so the server routes the
+                        # next offer to it without needing to re-join on a used connection.
+                        logger.info("WebRTC: session active, draining (5s then reconnect)")
+                        new_offer_sdp = None
+                        new_caller_id = None
+                        new_ice_servers = []
                         try:
-                            msg3 = json.loads(raw3)
-                        except Exception:
-                            continue
-                        sdp3 = msg3.get("sdpMessage", {})
-                        t3 = sdp3.get("type", "")
-                        if t3 == "candidate":
-                            cand = sdp3.get("data", {}).get("candidate", "")
-                            if cand:
-                                logger.info(f"WebRTC: phone trickle: {cand}")
-                        elif t3 == "offer":
-                            logger.info(f"WebRTC: re-offer from phone (bridge will restart on next token)")
-                except Exception:
-                    pass
+                            async with asyncio.timeout(5.0):
+                              async for raw3 in ws:
+                                try:
+                                    msg3 = json.loads(raw3)
+                                except Exception:
+                                    continue
+                                sdp3 = msg3.get("sdpMessage", {})
+                                if msg3.get("action") == "ice_msg" and sdp3.get("type") == "offer":
+                                    new_offer_sdp = sdp3["data"]["sdp"]
+                                    new_caller_id = msg3.get("from")
+                                    new_ice_servers = msg3.get("iceServers", [])
+                                    logger.info(f"WebRTC: offer during drain from {new_caller_id}")
+                                    break
+                                elif sdp3.get("type") == "candidate":
+                                    cand = sdp3.get("data", {}).get("candidate", "")
+                                    if cand:
+                                        logger.info(f"WebRTC: phone trickle ICE: {cand[:80]}")
+                                else:
+                                    logger.info(f"WebRTC: drain msg action={msg3.get('action')} type={sdp3.get('type')} from={msg3.get('from','?')[:20]}")
+                        except asyncio.TimeoutError:
+                            logger.info("WebRTC: drain 5s timeout, reconnecting to fresh connection")
+                        except Exception as e3:
+                            logger.info(f"WebRTC: drain exception: {e3}")
 
-        except Exception as e:
-            logger.error(f"WebRTC signaling error: {e}")
+                        if new_offer_sdp:
+                            # Collect trickle for the new offer on this same connection
+                            ice_cands = []
+                            try:
+                                async with asyncio.timeout(2.0):
+                                    async for raw_t in ws:
+                                        try:
+                                            msg_t = json.loads(raw_t)
+                                        except Exception:
+                                            continue
+                                        sdp_t = msg_t.get("sdpMessage", {})
+                                        if sdp_t.get("type") == "candidate":
+                                            c = sdp_t.get("data", {}).get("candidate", "")
+                                            if c:
+                                                ice_cands.append(c)
+                            except asyncio.TimeoutError:
+                                pass
+                            logger.info(f"WebRTC: collected {len(ice_cands)} trickle candidates for re-offer")
+                            if ice_cands:
+                                new_offer_sdp = self._inject_candidates(new_offer_sdp, ice_cands)
+
+                            # Answer on THIS connection (already re-joined, server still
+                            # knows us here). Closing and reconnecting causes the server
+                            # to tell the phone "device offline" before our answer arrives.
+                            logger.info(f"WebRTC: answering re-offer from {new_caller_id} on current connection")
+                            await loop.run_in_executor(
+                                None, _update_go2rtc_turn, self.go2rtc_config_path, new_ice_servers
+                            )
+                            new_answer_sdp = await loop.run_in_executor(
+                                None, self._post_offer_to_go2rtc, new_offer_sdp
+                            )
+                            if not new_answer_sdp:
+                                logger.warning("WebRTC: go2rtc did not return an answer for re-offer")
+                            else:
+                                await ws.send(json.dumps({
+                                    "action": "ice_msg",
+                                    "from": self.device_sn,
+                                    "to": new_caller_id,
+                                    "sdpMessage": {
+                                        "type": "answer",
+                                        "data": {"type": "answer", "sdp": new_answer_sdp},
+                                    },
+                                }))
+                                logger.info(f"WebRTC: re-offer answer sent to {new_caller_id}")
+                                for line in new_answer_sdp.replace("\r\n", "\n").split("\n"):
+                                    if line.startswith("a=candidate:"):
+                                        cand_val = line[2:]
+                                        await ws.send(json.dumps({
+                                            "action": "ice_msg",
+                                            "from": self.device_sn,
+                                            "to": new_caller_id,
+                                            "sdpMessage": {
+                                                "type": "candidate",
+                                                "data": {"candidate": cand_val, "sdpMLineIndex": 0},
+                                            },
+                                        }))
+                                        logger.info(f"WebRTC: re-offer trickle: {cand_val[:60]}")
+                                logger.info("WebRTC: session active, draining (re-offer)")
+                                # Continue draining on this same connection for further re-offers
+                                new_offer_sdp = None
+                                new_caller_id = None
+                                new_ice_servers = []
+                                try:
+                                    async for raw4 in ws:
+                                        try:
+                                            msg4 = json.loads(raw4)
+                                        except Exception:
+                                            continue
+                                        sdp4 = msg4.get("sdpMessage", {})
+                                        if msg4.get("action") == "ice_msg" and sdp4.get("type") == "offer":
+                                            new_offer_sdp = sdp4["data"]["sdp"]
+                                            new_caller_id = msg4.get("from")
+                                            new_ice_servers = msg4.get("iceServers", [])
+                                            logger.info(f"WebRTC: offer during re-drain from {new_caller_id}")
+                                            pending_offer = (new_offer_sdp, new_caller_id, new_ice_servers)
+                                            logger.info("WebRTC: reconnecting fresh for next answer (re-drain)")
+                                            break
+                                        elif sdp4.get("type") == "candidate":
+                                            cand4 = sdp4.get("data", {}).get("candidate", "")
+                                            if cand4:
+                                                logger.info(f"WebRTC: phone trickle ICE (re-drain): {cand4[:80]}")
+                                        else:
+                                            logger.info(f"WebRTC: re-drain msg action={msg4.get('action')} from={msg4.get('from','?')[:20]}")
+                                except Exception as e4:
+                                    logger.info(f"WebRTC: re-drain exception: {e4}")
+                        else:
+                            logger.info("WebRTC: session complete, reconnecting for next offer")
+
+                    else:
+                        # ── Offer collection connection (A) ──────────────────────
+                        # Wait for offer (re-join from update_token resets routing).
+                        offer_sdp = None
+                        caller_id = None
+                        ice_servers = []
+                        async for raw in ws:
+                            try:
+                                msg = json.loads(raw)
+                            except Exception:
+                                continue
+                            sdp_msg = msg.get("sdpMessage", {})
+                            caller_id = msg.get("from", caller_id)
+                            if msg.get("action") == "ice_msg" and sdp_msg.get("type") == "offer":
+                                offer_sdp = sdp_msg["data"]["sdp"]
+                                ice_servers = msg.get("iceServers", [])
+                                logger.info(f"WebRTC: offer received from {caller_id}, iceServers={json.dumps(ice_servers)}")
+                                break
+
+                        if not offer_sdp:
+                            logger.info("WebRTC: no offer received, reconnecting")
+                            if not self._stopped:
+                                await asyncio.sleep(0.5)
+                            continue
+
+                        # Collect trickle on this connection before reconnecting
+                        ice_candidates = []
+                        try:
+                            async with asyncio.timeout(2.0):
+                                async for raw2 in ws:
+                                    try:
+                                        msg2 = json.loads(raw2)
+                                    except Exception:
+                                        continue
+                                    sdp2 = msg2.get("sdpMessage", {})
+                                    if sdp2.get("type") == "candidate":
+                                        cand = sdp2.get("data", {}).get("candidate", "")
+                                        if cand:
+                                            ice_candidates.append(cand)
+                                            logger.debug(f"WebRTC: phone offer cand: {cand}")
+                        except asyncio.TimeoutError:
+                            pass
+                        logger.info(f"WebRTC: collected {len(ice_candidates)} trickle candidates")
+                        if ice_candidates:
+                            offer_sdp = self._inject_candidates(offer_sdp, ice_candidates)
+
+                        # Save and reconnect — answer must be on a fresh connection
+                        pending_offer = (offer_sdp, caller_id, ice_servers)
+                        logger.info("WebRTC: offer+trickle saved, reconnecting for fresh answer connection")
+
+            except Exception as e:
+                if self._stopped:
+                    return
+                logger.error(f"WebRTC signaling error: {e}")
+
+            if not self._stopped:
+                await asyncio.sleep(0.1)
 
     def start(self, on_done=None):
         """Run signaling in a daemon thread with its own event loop."""
         def _thread():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            self._loop = loop
             try:
                 loop.run_until_complete(self._run_async())
             except Exception as e:
@@ -1069,7 +1263,7 @@ class CrealityKlipperPlugin:
         try:
             if "set" in method:
                 for prop, value in params.items():
-                    self._handle_set(prop, value)
+                    self._handle_set(prop, value, params)
             elif "get" in method:
                 for prop in params:
                     response.update(self._handle_get(prop))
@@ -1081,7 +1275,7 @@ class CrealityKlipperPlugin:
 
         self.client.send_rpc_reply(request_id, json.dumps(response))
 
-    def _handle_set(self, prop, value):
+    def _handle_set(self, prop, value, all_params=None):
         """Translate Creality property sets into Klipper/Moonraker actions."""
         logger.info(f"SET {prop} = {value}")
 
@@ -1170,14 +1364,18 @@ class CrealityKlipperPlugin:
             self._attributes_msg["led_state"] = v
 
         elif prop == "pullclient":
-            # App is requesting camera stream
+            # App is requesting camera stream (or closing it when paired with livestream:0)
+            camera_closing = int((all_params or {}).get("livestream", 1)) == 0
             if self._webrtc_stream and self._jwt_token and self._device_sn:
-                # WebRTC mode: bridge should already be in standby; start new one if not
-                logger.info(f"WebRTC pullclient from {value}, bridge standby={self._webrtc_bridge is not None}")
-                if not self._webrtc_bridge:
-                    self._start_webrtc_standby()
-                # Acknowledge pullclient
-                self._send_attributes({"livestream": 1, "pullclient": str(value)})
+                logger.info(f"WebRTC pullclient from {value}, closing={camera_closing}, bridge={self._webrtc_bridge is not None}")
+                if camera_closing:
+                    # Camera close: bridge stays alive so it's immediately ready for next offer
+                    logger.info("WebRTC: camera closing, bridge stays in standby for next session")
+                else:
+                    # Camera open: ensure bridge is running
+                    if not self._webrtc_bridge:
+                        self._start_webrtc_standby()
+                    self._send_attributes({"livestream": 1, "pullclient": str(value)})
             elif self._has_camera:
                 # MJPEG fallback: respond with stream URL
                 camera_port = self.config.get("camera_port", 8080)
@@ -1221,9 +1419,14 @@ class CrealityKlipperPlugin:
                 self._device_sn = sn
                 self._save_token()
                 logger.info(f"jwtToken received, device_sn={sn}")
-                # Pre-connect to WebRTC signaling server if camera is configured
-                if self._webrtc_stream and not self._webrtc_bridge:
-                    self._start_webrtc_standby()
+                # Update or start WebRTC bridge when a new token arrives
+                if self._webrtc_stream:
+                    if self._webrtc_bridge:
+                        # Bridge already running — just update the token and reconnect
+                        logger.info("WebRTC: updating token on existing bridge")
+                        self._webrtc_bridge.update_token(self._jwt_token)
+                    else:
+                        self._start_webrtc_standby()
             else:
                 logger.info("jwtToken received (could not decode sn)")
 
@@ -1328,8 +1531,11 @@ class CrealityKlipperPlugin:
         self._webrtc_bridge = bridge
 
         def _on_bridge_done():
-            logger.info("WebRTC bridge finished, clearing bridge reference")
-            self._webrtc_bridge = None
+            if self._webrtc_bridge is bridge:
+                logger.info("WebRTC bridge finished, clearing bridge reference")
+                self._webrtc_bridge = None
+            else:
+                logger.info("WebRTC stale bridge finished (already replaced)")
 
         bridge.start(on_done=_on_bridge_done)
         logger.info(f"WebRTC standby started for sn={self._device_sn}")
