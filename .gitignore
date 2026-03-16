@@ -4,6 +4,7 @@
 # Credentials and device configs — never commit these
 config*.json
 *_session.json
+*_token.json
 *.tk
 
 # Python
